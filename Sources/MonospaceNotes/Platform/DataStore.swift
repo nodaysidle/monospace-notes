@@ -25,8 +25,9 @@
 //      reference (CON-DATA-WORKSPACE-FOLDER-REFERENCE) are in-memory state; this
 //      owner never writes them to disk and never stores them in `UserDefaults`.
 //      `UserDefaults` holds the typography and keybinding settings and nothing else.
-//    * Failures carry the note's file name and a short reason only: never note
-//      contents and never a directory path.
+//    * Failures carry the note's file name and a short, path-free reason only: never
+//      note contents. A caller's own user-facing alert may name the destination path
+//      (that caller's interface contract requires it), but this owner's values never do.
 //
 
 import Darwin
@@ -100,6 +101,11 @@ final class DataStore: NoteFileAccess, SettingsStoring, @unchecked Sendable {
     /// reports the documented default and `storeTypography(_:)` throws.
     nonisolated static let maximumPointSize: Double = 512
 
+    /// The largest note this store reads, in bytes (64 MiB). A larger file is refused
+    /// before it is loaded, so a very large file cannot exhaust memory; a plain-text
+    /// note far below this is the whole product scope.
+    nonisolated static let maximumNoteBytes: Int = 64 * 1024 * 1024
+
     // MARK: - Dependencies
 
     private let defaults: UserDefaults
@@ -132,6 +138,18 @@ final class DataStore: NoteFileAccess, SettingsStoring, @unchecked Sendable {
         recorder.record()
 
         let fileName = url.lastPathComponent
+
+        // Bound the read before it happens: a file over the cap is refused instead of
+        // being loaded whole into memory.
+        if let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+           size > DataStore.maximumNoteBytes {
+            let limit = DataStore.maximumNoteBytes / (1024 * 1024)
+            throw OperationError.readFailed(
+                fileName: fileName,
+                reason: "the file is larger than the \(limit) MB limit"
+            )
+        }
+
         let data: Data
         do {
             data = try Data(contentsOf: url)

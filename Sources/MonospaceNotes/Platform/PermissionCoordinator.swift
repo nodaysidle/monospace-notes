@@ -19,11 +19,13 @@
 //  How the contract is honoured here
 //  ---------------------------------
 //    * Selections. `chooseExistingNote()` and `chooseNewNoteDestination(suggestedName:)`
-//      are the only ways a path can enter the app. They present the standard macOS
-//      panels through the injected `PanelPresenting` and adopt a selection only when it
-//      is a `.txt` note location (`Self.allowedFileExtension`). A cancelled panel
-//      returns nil and changes nothing: no selection is recorded, no access scope is
-//      begun, and another explicit selection stays possible.
+//      are the only panels through which a user-selected note path enters the app: the
+//      composition root injects this coordinator as the panel seam of the features that
+//      open, save and save-as a note. They present the standard macOS panels through the
+//      injected `PanelPresenting` and adopt a selection only when it is a `.txt` note
+//      location (`Self.allowedFileExtension`). A cancelled panel returns nil and changes
+//      nothing: no selection is recorded, no access scope is begun, and another explicit
+//      selection stays possible.
 //    * Scope accounting. `beginAccess(to:)` is the single place a scope is begun. It
 //      refuses a location that carries no security-scoped bookmark, so a failure can
 //      never leak a scope, and it is idempotent per location, so repeating it never adds
@@ -45,8 +47,13 @@ import UniformTypeIdentifiers
 
 /// Owner of the filesystem permission contract: user-selected locations only, restricted
 /// to `.txt`, every access scope released.
+///
+/// It is the app's `PanelPresenting`: the composition root injects this coordinator as
+/// the panel seam of the features that open or save a single user-selected note, so a
+/// chosen path is validated against the locked `.txt` restriction and its access scope is
+/// accounted for here before any reader or writer reaches it.
 @MainActor
-final class PermissionCoordinator: Sendable {
+final class PermissionCoordinator: Sendable, PanelPresenting {
 
     // MARK: Locked surface
 

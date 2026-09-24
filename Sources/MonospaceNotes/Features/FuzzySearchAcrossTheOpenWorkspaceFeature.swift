@@ -260,6 +260,11 @@ final class FuzzySearchAcrossTheOpenWorkspaceFeature {
     /// Set by `cancelSearch()`; observed at every suspension point of an in-flight search.
     private var cancellationRequested: Bool = false
 
+    /// The generation of the most recently started search. A search whose generation is
+    /// no longer current was superseded by a newer query and must publish nothing, so a
+    /// slow older search can never overwrite the results of a newer one.
+    private var searchGeneration: Int = 0
+
     // MARK: - The workspace folder
 
     /// USER CLARIFICATION 2: the folder a search covers is the PARENT FOLDER of the note
@@ -314,6 +319,8 @@ final class FuzzySearchAcrossTheOpenWorkspaceFeature {
         cancellationRequested = false
         searchState = .active
         self.query = query
+        searchGeneration += 1
+        let generation = searchGeneration
         defer {
             // Every terminal path leaves this owner with no work in flight.
             isSearching = false
@@ -348,6 +355,11 @@ final class FuzzySearchAcrossTheOpenWorkspaceFeature {
         } else {
             let load = await Self.readWorkspace(folder: workspaceFolder, noteFiles: noteFiles)
 
+            // A newer query superseded this one while the folder was read: publish
+            // nothing, so the newer search's results are the ones that stand.
+            guard generation == searchGeneration else {
+                return superseded(since: start, clock: clock)
+            }
             if Task.isCancelled || cancellationRequested {
                 return publishCancelled(since: start, clock: clock)
             }
@@ -388,6 +400,9 @@ final class FuzzySearchAcrossTheOpenWorkspaceFeature {
             Self.match(query: typed, in: searchableSnapshot)
         }.value
 
+        guard generation == searchGeneration else {
+            return superseded(since: start, clock: clock)
+        }
         if Task.isCancelled || cancellationRequested {
             return publishCancelled(since: start, clock: clock)
         }
@@ -406,6 +421,9 @@ final class FuzzySearchAcrossTheOpenWorkspaceFeature {
     /// and leaves the last valid results in place. Safe to call with nothing in flight.
     func cancelSearch() {
         guard isSearching else { return }
+        // Bumping the generation invalidates the in-flight search, so even if a later
+        // query resets `cancellationRequested`, the old search still publishes nothing.
+        searchGeneration += 1
         cancellationRequested = true
         searchState = .cancelled
     }
@@ -642,6 +660,18 @@ final class FuzzySearchAcrossTheOpenWorkspaceFeature {
         lastOutcome = outcome
         lastSearchMilliseconds = outcome.milliseconds
         return outcome
+    }
+
+    /// A search that a newer query superseded: it publishes nothing at all — not even the
+    /// operation state — so the newer search's active/published state is never clobbered.
+    /// The returned outcome is only ever discarded by the caller.
+    private func superseded(since start: ContinuousClock.Instant, clock: ContinuousClock) -> SearchOutcome {
+        SearchOutcome(
+            state: .cancelled,
+            results: results,
+            emptyStateText: emptyStateText,
+            milliseconds: Self.milliseconds(of: start.duration(to: clock.now))
+        )
     }
 
     /// A cancelled search publishes no new results: the last valid results and empty
@@ -1174,8 +1204,13 @@ struct FuzzySearchView: View {
                 .focused($isSearchFieldFocused)
                 .onAppear { isSearchFieldFocused = true }
                 .onChange(of: query) { _, newQuery in
+                    let requested = newQuery
                     Task {
-                        outcome = await feature.search(query: newQuery, workspaceFolder: workspaceFolder())
+                        let result = await feature.search(query: requested, workspaceFolder: workspaceFolder())
+                        // A keystroke that landed while this search ran owns the field
+                        // now: drop this older result rather than showing its list.
+                        guard requested == query else { return }
+                        outcome = result
                         highlightedIndex = 0
                     }
                 }

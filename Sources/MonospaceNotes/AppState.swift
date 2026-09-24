@@ -457,7 +457,7 @@ final class AppState {
          settings: (any SettingsStoring)? = nil,
          ioRecorder: FileIOThreadRecorder = FileIOThreadRecorder(),
          lifecycle: LifecycleCoordinator = LifecycleCoordinator(),
-         permissions: PermissionCoordinator = PermissionCoordinator(),
+         permissions: PermissionCoordinator? = nil,
          coldLaunch: ColdLaunchUnder100msFeature? = nil,
          windowAppearance: DarkMonochromaticWindowAppearanceFeature? = nil,
          keystrokeRendering: KeystrokeRenderingUnder16msFeature? = nil,
@@ -470,11 +470,17 @@ final class AppState {
          openAndSavePanels: OpenAndSavePanelsForLocalFilesystemAccessFeature? = nil) {
         self.ioRecorder = ioRecorder
         self.lifecycle = lifecycle
-        self.permissions = permissions
+
+        // The permission coordinator is the app's panel seam: it wraps the same
+        // presenter the injected `panels` names, so a selection is restricted to `.txt`
+        // and its access scope is accounted for before a feature reads or writes it.
+        let resolvedPanels = panels ?? NativePanelPresenter()
+        let resolvedPermissions = permissions ?? PermissionCoordinator(presenter: resolvedPanels)
+        self.permissions = resolvedPermissions
+        self.panels = resolvedPanels
 
         let defaultStore = DataStore(recorder: ioRecorder)
         self.noteFiles = noteFiles ?? defaultStore
-        self.panels = panels ?? NativePanelPresenter()
         self.settings = settings ?? defaultStore
         self.coldLaunch = coldLaunch
             ?? ColdLaunchUnder100msFeature(settings: settings ?? defaultStore)
@@ -488,7 +494,7 @@ final class AppState {
         self.explicitSave = explicitSave
             ?? ExplicitSaveWithCmdSFeature(
                 noteFiles: noteFiles ?? defaultStore,
-                panels: panels ?? NativePanelPresenter()
+                panels: resolvedPermissions
             )
         self.fuzzySearch = fuzzySearch
             ?? FuzzySearchAcrossTheOpenWorkspaceFeature(noteFiles: noteFiles ?? defaultStore)
@@ -500,12 +506,12 @@ final class AppState {
         self.openAndEdit = openAndEdit
             ?? OpenAndEditAPlainTextNoteFeature(
                 noteFiles: noteFiles ?? defaultStore,
-                panels: panels ?? NativePanelPresenter()
+                panels: resolvedPermissions
             )
         self.openAndSavePanels = openAndSavePanels
             ?? OpenAndSavePanelsForLocalFilesystemAccessFeature(
-                panels: panels ?? NativePanelPresenter(),
-                permissions: permissions,
+                panels: resolvedPanels,
+                permissions: resolvedPermissions,
                 noteFiles: noteFiles ?? defaultStore
             )
 
@@ -558,6 +564,15 @@ final class AppState {
             guard let self else { return }
             self.backgroundSaveState = outcome.state
             self.statusMessage = outcome.statusMessage
+            // A successful autosave committed exactly the buffer it started from. The
+            // document is no longer dirty only when no edit landed while the write was in
+            // flight — i.e. the buffer that reached disk is still the current buffer.
+            if outcome.state == .succeeded,
+               let saved = self.backgroundSave.lastSavedBuffer,
+               saved == self.documentText {
+                self.openAndEdit.markSaved()
+                self.hasUnsavedChanges = false
+            }
         }
     }
 
@@ -610,10 +625,8 @@ final class AppState {
         workspaceFolder = url.deletingLastPathComponent()
         windowTitle = outcome.windowTitle ?? OpenAndEditAPlainTextNoteFeature.windowTitle(for: url)
         hasUnsavedChanges = false
-        openAndEdit.adoptOpenedDocument(
-            outcome,
-            into: keystrokeRendering.documentTextView ?? coldLaunch.documentView
-        )
+        openAndEdit.adoptOpenedDocument(outcome, into: activeDocumentTextView)
+        recomputeDocumentCounts()
     }
 
     /// FEAT-EXPLICIT-SAVE-WITH-CMD-S: Cmd+S.
@@ -716,7 +729,7 @@ final class AppState {
     /// Makes the document text view the window's first responder, so typing goes to the
     /// note rather than to whichever control last had focus.
     func focusDocument() {
-        guard let textView = keystrokeRendering.documentTextView,
+        guard let textView = activeDocumentTextView,
               let window = textView.window else { return }
         window.makeFirstResponder(textView)
     }
@@ -746,22 +759,80 @@ final class AppState {
     }
 
     /// The number of whitespace-separated words in the buffer.
-    var wordCount: Int {
-        var count = 0
+    ///
+    /// Published state, not a per-render scan: the counts are recomputed off the main
+    /// actor (`scheduleDocumentCountRefresh`) after a keystroke, so typing a large note
+    /// never makes the status bar re-scan the whole buffer synchronously between frames.
+    /// The discrete paths (opening a note, adopting a buffer, a direct AppKit edit)
+    /// recompute synchronously.
+    private(set) var wordCount: Int = 0
+
+    /// The number of characters (grapheme clusters) in the buffer. Published the same
+    /// way as `wordCount`.
+    private(set) var characterCount: Int = 0
+
+    /// The coalesced count refresh scheduled by the keystroke path; a test can await it
+    /// to observe the published counts.
+    private(set) var countRefreshTask: Task<Void, Never>?
+
+    /// Recomputes both counts synchronously. Used by the discrete paths (opening a note,
+    /// adopting a buffer, a direct AppKit edit), never by the keystroke path.
+    private func recomputeDocumentCounts() {
+        countRefreshTask?.cancel()
+        let counts = Self.counts(of: documentText)
+        wordCount = counts.words
+        characterCount = counts.characters
+    }
+
+    /// Schedules a coalesced, off-main recomputation of both counts. A newer edit
+    /// cancels the pending one, so only the last buffer is counted and the main actor
+    /// never scans the buffer on the keystroke path.
+    private func scheduleDocumentCountRefresh() {
+        countRefreshTask?.cancel()
+        let text = documentText
+        countRefreshTask = Task { [weak self] in
+            let counts = await Task.detached(priority: .utility) {
+                Self.counts(of: text)
+            }.value
+            guard !Task.isCancelled else { return }
+            self?.wordCount = counts.words
+            self?.characterCount = counts.characters
+        }
+    }
+
+    /// The word and character counts of a buffer. Pure and nonisolated, so it can run
+    /// off the main actor.
+    nonisolated static func counts(of text: String) -> (words: Int, characters: Int) {
+        var words = 0
         var inWord = false
-        for scalar in documentText.unicodeScalars {
+        for scalar in text.unicodeScalars {
             if scalar.properties.isWhitespace {
                 inWord = false
             } else if !inWord {
                 inWord = true
-                count += 1
+                words += 1
             }
         }
-        return count
+        return (words, text.count)
     }
 
-    /// The number of characters (grapheme clusters) in the buffer.
-    var characterCount: Int { documentText.count }
+    /// The one document text view in effect: the keystroke owner's surface, or the
+    /// launch surface before the keystroke owner attached it. A single accessor, so the
+    /// two holders never diverge across call sites.
+    private var activeDocumentTextView: NSTextView? {
+        keystrokeRendering.documentTextView ?? coldLaunch.documentView
+    }
+
+    /// Writes a buffer onto the live document text view, so the surface shows exactly
+    /// the text the state holds. A no-op when no surface exists.
+    private func adoptBuffer(_ text: String, into textView: NSTextView?) {
+        guard let textView else { return }
+        if textView.string != text {
+            textView.string = text
+            textView.setSelectedRange(NSRange(location: 0, length: 0))
+        }
+        textView.needsDisplay = true
+    }
 
     /// FEAT-FUZZY-SEARCH-ACROSS-THE-OPEN-WORKSPACE: one keystroke in the search field.
     /// The results, the empty-state message, the operation state and the measured
@@ -798,6 +869,10 @@ final class AppState {
         workspaceFolder = url.deletingLastPathComponent()
         windowTitle = url.lastPathComponent
         hasUnsavedChanges = false
+        // The selected note is adopted into the same buffer the open path uses: the
+        // surface the user sees must show the note the state now holds.
+        adoptBuffer(text, into: activeDocumentTextView)
+        recomputeDocumentCounts()
     }
 
     /// Publishes one search outcome: the results, the documented empty-state text, the
@@ -848,10 +923,7 @@ final class AppState {
         _ draft: SettingsWindowForTypographyAndKeybindingsFeature.Draft
     ) {
         do {
-            let result = try settingsWindow.apply(
-                draft,
-                to: keystrokeRendering.documentTextView ?? coldLaunch.documentView
-            )
+            let result = try settingsWindow.apply(draft, to: activeDocumentTextView)
             typography = result.typography
             keybindings = result.keybindings
             settingsMessage = result.inlineMessage
@@ -874,7 +946,7 @@ final class AppState {
     /// write is reachable from here: the keystroke path holds no I/O service.
     @discardableResult
     func handleKeystrokeInsert(_ character: String) -> Bool {
-        guard let textView = keystrokeRendering.documentTextView ?? coldLaunch.documentView else {
+        guard let textView = activeDocumentTextView else {
             statusMessage = StatusMessage(
                 text: "Keystroke insertion is unavailable: no document surface is open.",
                 isFailure: true
@@ -906,6 +978,9 @@ final class AppState {
             // result here so `hasUnsavedChanges` reflects real typing.
             openAndEdit.noteEdit(previous: previousBuffer, new: documentText)
             hasUnsavedChanges = openAndEdit.hasUnsavedChanges
+            // The status bar's counts are refreshed off the main actor, never by an O(n)
+            // scan on the keystroke path itself.
+            scheduleDocumentCountRefresh()
         }
         return measurement.inserted
     }
@@ -922,6 +997,7 @@ final class AppState {
         backgroundSave.noteEdit(buffer: documentText, documentURL: documentURL)
         openAndEdit.noteEdit(previous: previousBuffer, new: documentText)
         hasUnsavedChanges = openAndEdit.hasUnsavedChanges
+        recomputeDocumentCounts()
     }
 
     /// The last keystroke's outcome, owned by the keystroke-rendering feature.
@@ -936,9 +1012,23 @@ final class AppState {
     /// termination reports 0.
     @discardableResult
     func terminate() async -> Int {
+        removeTerminationHook()
         permissions.releaseAllScopes()
         keystrokeRendering.releaseSurfaceResources()
+        // The autosave timer/attempt and an in-flight search hold work of their own, so
+        // they are cancelled and awaited here rather than left running into process exit.
+        fuzzySearch.cancelSearch()
+        _ = await backgroundSave.cancel()
         return await lifecycle.beginTermination()
+    }
+
+    /// Removes the termination observer installed by `installTerminationHook()`. Safe to
+    /// repeat; a nil observer is a no-op.
+    private func removeTerminationHook() {
+        if let terminationObserver {
+            NotificationCenter.default.removeObserver(terminationObserver)
+            self.terminationObserver = nil
+        }
     }
 
     /// Wires the termination contract to the frozen app entry.
@@ -959,8 +1049,10 @@ final class AppState {
             // Delivered on the main queue, so the main actor is the current actor here.
             MainActor.assumeIsolated {
                 guard let self else { return }
-                self.permissions.releaseAllScopes()
-                Task { _ = await self.lifecycle.beginTermination() }
+                // Everything this composition holds — access scopes, the autosave
+                // timer/attempt, the surface, an in-flight search, the lifecycle's
+                // registered work — is released through the one termination entry point.
+                Task { _ = await self.terminate() }
             }
         }
     }
@@ -1025,8 +1117,7 @@ final class AppState {
         AnyView(SettingsView(
             feature: settingsWindow,
             documentTextView: { [weak self] in
-                guard let self else { return nil }
-                return self.keystrokeRendering.documentTextView ?? self.coldLaunch.documentView
+                self?.activeDocumentTextView
             },
             onApply: { [weak self] result in
                 guard let self else { return }

@@ -296,6 +296,12 @@ final class NonBlockingBackgroundSaveFeature {
     /// The most recent attempt, whatever its outcome.
     private(set) var lastOutcome: BackgroundSaveOutcome?
 
+    /// The exact buffer the most recent *successful* attempt committed to disk, `nil`
+    /// until then. The composition root compares it with the live buffer to decide
+    /// whether a successful autosave really saved the current text (no edit landed while
+    /// the write was in flight), so the dirty marker is only cleared when that is true.
+    private(set) var lastSavedBuffer: String?
+
     /// How many attempts have been made. A failed attempt counts: it was attempted. An
     /// attempt that found no destination never reached the writer and does not count.
     private(set) var writeAttemptCount: Int = 0
@@ -580,6 +586,7 @@ final class NonBlockingBackgroundSaveFeature {
             )
         }
 
+        lastSavedBuffer = text
         return BackgroundSaveOutcome(
             state: .succeeded,
             statusMessage: nil,

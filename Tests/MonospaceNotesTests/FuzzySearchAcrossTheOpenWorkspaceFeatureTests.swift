@@ -1263,6 +1263,49 @@ struct FuzzySearchAcrossTheOpenWorkspaceFeatureTests {
         _ = first
     }
 
+    @Test("A query superseded by a newer one publishes nothing, so the newer results stand")
+    func newerQuerySupersedesAnOlderInFlightOne() async throws {
+        let root = try fuzzySearchTestScratchDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let folder = root.appendingPathComponent("notes", isDirectory: true)
+        let alpha = try fuzzySearchTestWriteNote(named: "alpha-note.txt", text: "the alpha note\n", in: folder)
+        let beta = try fuzzySearchTestWriteNote(named: "beta-note.txt", text: "the beta note\n", in: folder)
+
+        let gate = FuzzySearchTestGate()
+        let files = FuzzySearchTestNoteFileAccess(
+            texts: [alpha: "the alpha note\n", beta: "the beta note\n"],
+            gate: gate
+        )
+        let feature = FuzzySearchTestFeature(noteFiles: files)
+
+        // A first search establishes the snapshot the next query would otherwise reuse.
+        let primed = await feature.search(query: "alpha", workspaceFolder: folder)
+        #expect(primed.state == .succeeded)
+
+        // Park an older query in flight, then let a newer query run to completion while
+        // the older one is still suspended. The older one is now superseded.
+        feature.refreshWorkspace()
+        files.armGate()
+        let older = Task { () -> FuzzySearchTestFeature.SearchOutcome in
+            await feature.search(query: "alpha", workspaceFolder: folder)
+        }
+        await gate.waitForEntry()
+
+        let newer = await feature.search(query: "beta", workspaceFolder: folder)
+        #expect(newer.state == .succeeded)
+        let newerResults = newer.results
+        #expect(newerResults.map(\.displayName) == ["beta-note.txt"])
+
+        // Release the older query: it must not overwrite the newer query's results.
+        await gate.open()
+        let olderOutcome = await older.value
+
+        #expect(olderOutcome.state == .cancelled, "a superseded search publishes nothing")
+        #expect(feature.results == newerResults, "the newer query's results stand")
+        #expect(feature.searchState == .succeeded, "the newer query's state stands")
+        #expect(feature.isSearching == false, "no work is left in flight")
+    }
+
     // MARK: - Reading failures
 
     @Test("A note that cannot be read is skipped, a folder that cannot be listed is reported, and the search never crashes")

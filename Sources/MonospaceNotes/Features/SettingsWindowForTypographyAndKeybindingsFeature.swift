@@ -283,13 +283,21 @@ final class SettingsWindowForTypographyAndKeybindingsFeature {
     /// plus the family in effect and the documented default so the current choice is
     /// never missing from the list. Sorted, so the list is stable across openings.
     func availableFontFamilies() -> [String] {
+        // Measuring every installed family is expensive, and the offered set is stable
+        // for the life of the window, so it is measured once and then reused.
+        if let cached = cachedAvailableFontFamilies { return cached }
         var offered = Set(Self.monospaceFamilies(NSFontManager.shared.availableFontFamilies))
         for family in [typography.fontFamily, DataStore.defaultFontFamily]
         where Self.isAvailableFamily(family) {
             offered.insert(family)
         }
-        return offered.sorted()
+        let families = offered.sorted()
+        cachedAvailableFontFamilies = families
+        return families
     }
+
+    /// The measured monospaced-family list, computed on first use.
+    private var cachedAvailableFontFamilies: [String]?
 
     /// The binding in effect for a command.
     func keybinding(for command: Command) -> KeyBinding {

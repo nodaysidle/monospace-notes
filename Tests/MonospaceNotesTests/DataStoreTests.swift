@@ -307,6 +307,30 @@ struct DataStoreTests {
         #expect(fileName == "binary.txt")
     }
 
+    @Test("A note larger than the read cap is refused instead of loaded")
+    func oversizedNoteIsRefused() async throws {
+        let scratch = try dataStoreTestScratchDirectory()
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let (suiteName, defaults) = try dataStoreTestSuite()
+        defer { dataStoreTestDiscardSuite(suiteName) }
+
+        let store = DataStore(defaults: defaults, recorder: FileIOThreadRecorder())
+        let destination = scratch.appendingPathComponent("huge.txt")
+        // A sparse file one byte over the cap: no large write is needed.
+        FileManager.default.createFile(atPath: destination.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: destination)
+        try handle.truncate(atOffset: UInt64(DataStore.maximumNoteBytes) + 1)
+        try handle.close()
+
+        let error = await dataStoreTestOperationError { _ = try await store.readUTF8(from: destination) }
+        guard case .readFailed(let fileName, let reason)? = error else {
+            Issue.record("Expected .readFailed, received \(String(describing: error))")
+            return
+        }
+        #expect(fileName == "huge.txt")
+        #expect(reason.contains("larger"), "The refusal states the size limit")
+    }
+
     // MARK: - Atomic saves (CON-DATA-TEMPORARY-SAVE-FILE, CON-PERSISTENCE-TEMPORARY-SAVE-FILE)
 
     @Test("A save writes exactly the contents and leaves no temporary file behind")
