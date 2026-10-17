@@ -65,6 +65,18 @@ The window is black (`#000000`) with a high-contrast monospace foreground (at le
 
 All five can be remapped in Settings; the menus and the empty-window hint follow your choices.
 
+## Download
+
+Download [`Monospace.Notes.dmg`](https://github.com/nodaysidle/monospace-notes/releases/download/v1.0.0/Monospace.Notes.dmg) from release [`v1.0.0`](https://github.com/nodaysidle/monospace-notes/releases/tag/v1.0.0). Requires macOS 14 or later on Apple silicon.
+
+| File | Size | SHA-256 |
+|---|---|---|
+| `Monospace.Notes.dmg` | 830,887 bytes | `dea6e2b794cd8be6f85a1ea0b588f6541dbf737c27620077ce6ba3f0dd82f1f9` |
+
+Verify with `shasum -a 256 Monospace.Notes.dmg` and compare against the SHA-256 above.
+
+The release asset is named `Monospace.Notes.dmg` (with a dot). A local build with `./Scripts/package_app.sh` writes `dist/Monospace Notes.dmg` (with a space) instead, as described below.
+
 ## Build and run
 
 Requirements: macOS 14 or later on Apple silicon, and Swift 6 (Xcode 16 or later, or a Swift 6 toolchain).
